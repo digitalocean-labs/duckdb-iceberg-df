@@ -374,8 +374,18 @@ OrphanDeleteStatus DeleteListedFile(FileSystem &fs, const string &path, const Or
 		auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
 		current = handle->Stats();
 	}
+	// S3-compatible stores (VAST, MinIO) list LastModified with sub-second precision while a HEAD's
+	// Last-Modified header has whole seconds, and may quote ETags differently in LIST and HEAD.
+	auto same_time = local ? current && current->last_modification_time == listed.last_modified
+	                       : current && Timestamp::GetEpochSeconds(current->last_modification_time) ==
+	                                        Timestamp::GetEpochSeconds(listed.last_modified);
+	auto unquote = [](const string &tag) {
+		return tag.size() >= 2 && tag.front() == '"' && tag.back() == '"' ? tag.substr(1, tag.size() - 2) : tag;
+	};
+	auto same_tag = current && (local ? current->version_tag == listed.tag
+	                                  : unquote(current->version_tag) == unquote(listed.tag));
 	if (!current || current->file_type != FileType::FILE_TYPE_REGULAR || current->file_size != listed.size ||
-	    current->last_modification_time != listed.last_modified || current->version_tag != listed.tag) {
+	    !same_time || !same_tag) {
 		return OrphanDeleteStatus::FAILED;
 	}
 	if (local) {
