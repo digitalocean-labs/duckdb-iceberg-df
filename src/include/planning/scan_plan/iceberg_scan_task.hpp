@@ -18,6 +18,7 @@ struct IcebergDataFileDescriptor {
 	optional<int64_t> first_row_id;
 	IcebergRowLineageMode row_lineage_mode = IcebergRowLineageMode::COMMITTED;
 	int32_t partition_spec_id = 0;
+	bool inherit_sequence_number = false;
 };
 
 //! Complete materialized scan input, with no references to planner-owned manifests.

@@ -507,6 +507,28 @@ void BoundRewrittenRows(ClientContext &context, RewritePlan &plan, const Iceberg
 	}
 }
 
+void CollectDanglingDVs(RewritePlan &plan, const vector<IcebergManifestListEntry> &manifest_files) {
+	unordered_set<string> rewritten;
+	for (auto &candidate : plan.selected_candidates) {
+		rewritten.insert(candidate.file_path);
+	}
+	for (auto &list_entry : manifest_files) {
+		if (list_entry.GetFile().content != IcebergManifestContentType::DELETE) {
+			continue;
+		}
+		for (auto &entry : list_entry.GetManifestEntries()) {
+			auto &file = entry.data_file;
+			if (entry.status == IcebergManifestEntryStatusType::DELETED || !file.IsDeletionVector() ||
+			    !file.referenced_data_file) {
+				continue;
+			}
+			if (rewritten.count(*file.referenced_data_file)) {
+				plan.dangling_dvs.emplace_back(file.file_path, file.content_offset);
+			}
+		}
+	}
+}
+
 } // namespace
 
 //! The rewrite plans from the committed table: the files it selects and the schema and partition spec it writes
@@ -514,14 +536,14 @@ void BoundRewrittenRows(ClientContext &context, RewritePlan &plan, const Iceberg
 //! again or lost, and a pending schema or spec change would not reach the files it writes, so the rewrite is
 //! refused after any change to the table. The one exception is a format-version upgrade, which the rewrite
 //! follows: its snapshot uses the new version.
-static void ThrowIfTableHasPendingChanges(ClientContext &context, const IcebergTable &table_info) {
+static int32_t EffectiveFormatVersion(ClientContext &context, const IcebergTable &table_info) {
 	auto &transaction = IcebergTransaction::Get(context, table_info.catalog);
 	auto state = transaction.GetLatestTableState(table_info.GetTableKey());
 	if (!state || state->IsMissing() || !state->GetInfo().transaction_data) {
-		return;
+		return table_info.GetMetadata().iceberg_version;
 	}
-	auto &transaction_data = *state->GetInfo().transaction_data;
-	ValidateRewriteTransaction(transaction_data);
+	ValidateRewriteTransaction(*state->GetInfo().transaction_data);
+	return state->GetInfo().GetMetadata().iceberg_version;
 }
 
 RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input) {
@@ -530,7 +552,7 @@ RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input)
 
 	auto table_info_ptr = ReloadIcebergTableShared(context, input.table_name, "iceberg_rewrite_data_files");
 	auto &table_info = *table_info_ptr;
-	ThrowIfTableHasPendingChanges(context, table_info);
+	auto effective_format_version = EffectiveFormatVersion(context, table_info);
 	auto &table_metadata = table_info.GetMetadata();
 	if (table_metadata.iceberg_version < 2) {
 		throw NotImplementedException("iceberg_rewrite_data_files on Iceberg V%d tables",
@@ -559,8 +581,16 @@ RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input)
 	plan.table_info = std::move(table_info_ptr);
 	table_info.VerifyWriteEncryptionSupported();
 
-	if (table_metadata.iceberg_version >= 3) {
-		throw NotImplementedException("iceberg_rewrite_data_files does not yet support V3 tables");
+	plan.write_row_lineage = effective_format_version >= 3;
+	if (plan.write_row_lineage) {
+		for (auto &column : table_metadata.GetLatestSchema().columns) {
+			if (StringUtil::CIEquals(column->name, "_row_id") ||
+			    StringUtil::CIEquals(column->name, "_last_updated_sequence_number")) {
+				throw InvalidInputException("iceberg_rewrite_data_files: a table column conflicts with reserved "
+				                            "row-lineage column '%s'",
+				                            column->name);
+			}
+		}
 	}
 
 	//! Reject an unknown or historical output spec before reading manifests.
@@ -613,6 +643,7 @@ RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input)
 	}
 
 	CollectFullyAppliedDeleteFiles(plan, table_metadata, manifest_files);
+	CollectDanglingDVs(plan, manifest_files);
 	BoundRewrittenRows(context, plan, table_metadata, manifest_files);
 	return plan;
 }

@@ -968,17 +968,21 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 		}
 
 		if (new_format_version.IsValid()) {
+			auto requested_version = (int32_t)new_format_version.GetIndex();
 			auto current_version = updated_table.GetMetadataMutable().iceberg_version;
-			if ((int32_t)new_format_version.GetIndex() < current_version) {
+			if (requested_version < current_version) {
 				throw InvalidInputException("Cannot downgrade format-version from %d to %d", current_version,
-				                            new_format_version.GetIndex());
+				                            requested_version);
 			}
-			if ((int32_t)new_format_version.GetIndex() > MAX_ICEBERG_FORMAT_VERSION) {
+			if (requested_version > MAX_ICEBERG_FORMAT_VERSION) {
 				throw InvalidInputException("Cannot upgrade format-version to %d, the highest supported version is %d",
-				                            new_format_version.GetIndex(), MAX_ICEBERG_FORMAT_VERSION);
+				                            requested_version, MAX_ICEBERG_FORMAT_VERSION);
 			}
-			updated_table.GetMetadataMutable().iceberg_version = (int32_t)new_format_version.GetIndex();
-			transaction_data.TableAddUpradeFormatVersion();
+			//! Re-setting the current version is a no-op
+			if (requested_version > current_version) {
+				updated_table.GetMetadataMutable().iceberg_version = requested_version;
+				transaction_data.TableAddUpradeFormatVersion();
+			}
 		}
 
 		if (!new_properties.empty()) {

@@ -121,6 +121,11 @@ void IcebergScanPlanner::RequireRowIds() {
 	shared_state->RequireRowIds();
 }
 
+void IcebergScanPlanner::InheritSequenceNumbers() {
+	annotated_lock_guard<annotated_mutex> guard(shared_state->lock);
+	shared_state->InheritSequenceNumbers();
+}
+
 const IcebergTableFilters &IcebergScanPlanner::Filters() const {
 	return table_filters;
 }
@@ -284,6 +289,7 @@ IcebergDataFileDescriptor IcebergScanPlanner::CreateDataFileDescriptor(const Bou
 	task.first_row_id = entry.HasFirstRowId() ? optional<int64_t>(entry.GetFirstRowId()) : nullopt;
 	task.row_lineage_mode = bound_manifest.row_lineage_mode;
 	task.partition_spec_id = manifest.partition_spec_id;
+	task.inherit_sequence_number = shared_state->Configuration().inherit_sequence_numbers;
 	return task;
 }
 

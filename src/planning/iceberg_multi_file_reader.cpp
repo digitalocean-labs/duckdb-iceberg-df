@@ -50,6 +50,9 @@ OpenFileInfo IcebergMultiFileReader::FileInfo(const IcebergDataFileDescriptor &f
 	if (file.sequence_number) {
 		options["sequence_number"] = Value::BIGINT(*file.sequence_number);
 	}
+	if (file.inherit_sequence_number) {
+		options["inherit_sequence_number"] = Value::BOOLEAN(true);
+	}
 	return result;
 }
 
@@ -777,8 +780,8 @@ MultiFileReaderVirtualColumnBinding IcebergMultiFileReader::GetVirtualColumnExpr
 			throw InternalException("Missing extended info for data file");
 		}
 		auto &options = reader_data.file_to_be_opened.extended_info->options;
-		if (options.find("first_row_id") == options.end()) {
-			//! A data file without a 'first_row_id' reads NULL for '_last_updated_sequence_number'
+		if (options.find("first_row_id") == options.end() && options.find("inherit_sequence_number") == options.end()) {
+			//! Without a row range only rewrite scans inherit the file's data sequence number
 			return MultiFileReaderVirtualColumnBinding(Value(LogicalType::BIGINT));
 		}
 		auto entry = options.find("sequence_number");

@@ -51,7 +51,8 @@ public:
 	                   IcebergWriteOperation write_operation);
 
 	void PlanCopy(ClientContext &context, PhysicalPlanGenerator &planner, const IcebergTableMetadata &metadata,
-	              PhysicalOperator &rows, optional_idx target_file_size = optional_idx());
+	              PhysicalOperator &rows, optional_idx target_file_size = optional_idx(),
+	              IcebergInsertVirtualColumns virtual_columns = IcebergInsertVirtualColumns::NONE);
 
 	bool IsSink() const override {
 		return !children.empty();

@@ -111,12 +111,12 @@ void IcebergDataFileStats::PopulateFromReturnStats(ClientContext &context, Icebe
 		auto &col_name = StringValue::Get(struct_children[0]);
 		auto &col_stats = MapValue::GetChildren(struct_children[1]);
 		auto column_names = ParseQuotedList(col_name, '.');
-		if (column_names[0] == "_row_id") {
-			continue;
-		}
-
 		optional_idx name_offset;
 		auto column_info_p = ic_schema.GetFromPath(StringsToIdentifiers(column_names), &name_offset);
+		//! Lineage columns have no manifest statistics
+		if (!column_info_p && (column_names[0] == "_row_id" || column_names[0] == "_last_updated_sequence_number")) {
+			continue;
+		}
 		if (!column_info_p) {
 			auto normalized_col_name = StringUtil::Join(column_names, ".");
 			throw InternalException("Column '%s' can not be found in the schema, but returned by RETURN_STATS",

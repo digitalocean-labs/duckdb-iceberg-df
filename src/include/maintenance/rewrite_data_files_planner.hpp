@@ -8,6 +8,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 
+#include "core/metadata/iceberg_file_identity.hpp"
 #include "core/metadata/manifest/iceberg_manifest.hpp"
 
 namespace duckdb {
@@ -32,6 +33,7 @@ struct RewritePlan {
 	QualifiedName table_name;
 	int64_t starting_snapshot_id = -1;
 	int64_t starting_sequence_number = 0;
+	bool write_row_lineage = false;
 	//! Iceberg spec default for write.target-file-size-bytes (same as IcebergCopyOptions::file_size_bytes).
 	int64_t target_file_size_bytes = 512LL * 1024 * 1024;
 	//! Keep the loaded metadata alive until commit.
@@ -41,6 +43,8 @@ struct RewritePlan {
 	//! Distinct delete-file paths whose referenced data files were all selected.
 	//! Invalidated on the same REPLACE commit as the rewritten data files.
 	vector<string> delete_files_to_remove;
+	//! Deletion vectors that dangle once their referenced data files are replaced
+	vector<IcebergFileIdentity> dangling_dvs;
 	//! The rows the selected files hold before deletes: the most the rewrite can write
 	int64_t selected_record_count = 0;
 	//! The most rows the deletes that may apply to the selected files can remove, so the rewrite writes at least
