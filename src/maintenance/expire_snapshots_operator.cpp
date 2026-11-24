@@ -10,6 +10,7 @@
 #include "catalog/rest/transaction/iceberg_transaction.hpp"
 #include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "core/metadata/iceberg_table_metadata.hpp"
+#include "maintenance/expire_snapshots_cleanup.hpp"
 #include "maintenance/maintenance_table_loader.hpp"
 
 namespace duckdb {
@@ -101,6 +102,11 @@ ExpireSnapshotsPlan ExecuteSnapshotExpiration(ClientContext &context, const Expi
 		return plan;
 	}
 
+	vector<string> cleanup_files;
+	if (input.clean_expired_files && catalog.attach_options.remove_files_on_delete) {
+		cleanup_files = PlanExpiredSnapshotFiles(context, visible_table.GetMetadata(), plan.to_expire);
+	}
+
 	ApplyTableUpdate(guard, visible_table, transaction, [&](IcebergTable &table) {
 		auto &transaction_data = table.GetOrCreateTransactionData(transaction);
 		transaction_data.TableRemoveSnapshots(plan.to_expire);
@@ -108,6 +114,7 @@ ExpireSnapshotsPlan ExecuteSnapshotExpiration(ClientContext &context, const Expi
 		//! from the remaining snapshots.
 		ApplyExpirationToTransactionMetadata(table.GetMetadataMutable(), plan.to_expire);
 	});
+	ScheduleExpiredFileCleanup(context, std::move(cleanup_files));
 	return plan;
 }
 

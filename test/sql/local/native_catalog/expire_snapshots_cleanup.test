@@ -1,0 +1,344 @@
+# name: test/sql/local/native_catalog/expire_snapshots_cleanup.test
+# description: Opt-in snapshot expiration cleanup deletes only unreferenced files after commit and fails closed
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+require-env FILE_CLEANUP_SUPPORT
+
+include test/sql/init_requires
+
+require json
+
+# Default: expiration commits its metadata change and leaves every file in place.
+statement ok
+CREATE TABLE my_datalake.default.expire_cleanup_default (id INTEGER) WITH ('format-version' = '2');
+
+foreach value 1 2
+
+statement ok
+INSERT INTO my_datalake.default.expire_cleanup_default VALUES ({value});
+
+endloop
+
+statement ok
+SET VARIABLE default_location = (
+	SELECT json_extract_string(body, '$.metadata.location')
+	FROM iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/expire_cleanup_default', NULL)
+);
+
+statement ok
+SET VARIABLE default_files = (
+	SELECT list(file ORDER BY file) FROM glob(getvariable('default_location') || '/**')
+	WHERE file NOT LIKE '%.metadata.json'
+);
+
+query II
+SELECT * FROM iceberg_expire_snapshots('my_datalake.default.expire_cleanup_default',
+	older_than => TIMESTAMP '2999-01-01', retain_last => 1);
+----
+1	1
+
+query I
+SELECT list(file ORDER BY file) = getvariable('default_files') FROM glob(getvariable('default_location') || '/**')
+WHERE file NOT LIKE '%.metadata.json';
+----
+true
+
+# A rewrite leaves the old data files reachable only through the expired snapshots.
+statement ok
+CREATE TABLE my_datalake.default.expire_cleanup_rewrite (id INTEGER) WITH ('format-version' = '2');
+
+foreach value 1 2 3
+
+statement ok
+INSERT INTO my_datalake.default.expire_cleanup_rewrite VALUES ({value});
+
+endloop
+
+query II
+SELECT rewritten_data_files_count, added_data_files_count
+FROM iceberg_rewrite_data_files('my_datalake.default.expire_cleanup_rewrite', rewrite_all = true);
+----
+3	1
+
+statement ok
+SET VARIABLE rewrite_location = (
+	SELECT json_extract_string(body, '$.metadata.location')
+	FROM iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/expire_cleanup_rewrite', NULL)
+);
+
+query II
+SELECT * FROM iceberg_expire_snapshots('my_datalake.default.expire_cleanup_rewrite',
+	older_than => TIMESTAMP '2999-01-01', retain_last => 1, clean_expired_files => true);
+----
+3	1
+
+query I
+SELECT list(file ORDER BY file) = (
+	SELECT list(file_path ORDER BY file_path) FROM iceberg_metadata(my_datalake.default.expire_cleanup_rewrite)
+	WHERE content = 'DATA' AND status <> 'DELETED'
+) FROM glob(getvariable('rewrite_location') || '/**/*.parquet');
+----
+true
+
+query I
+SELECT list(file ORDER BY file) = (
+	SELECT list(path ORDER BY path) FROM (
+		SELECT path FROM iceberg_manifests(my_datalake.default.expire_cleanup_rewrite)
+		UNION
+		SELECT manifest_list FROM iceberg_snapshots(my_datalake.default.expire_cleanup_rewrite)
+		WHERE sequence_number = (
+			SELECT max(sequence_number) FROM iceberg_snapshots(my_datalake.default.expire_cleanup_rewrite)
+		)
+	)
+) FROM glob(getvariable('rewrite_location') || '/metadata/*.avro');
+----
+true
+
+query I
+SELECT list(id ORDER BY id) FROM my_datalake.default.expire_cleanup_rewrite;
+----
+[1, 2, 3]
+
+# Appends only: every data file stays live through the retained snapshot.
+statement ok
+CREATE TABLE my_datalake.default.expire_cleanup_appends (id INTEGER) WITH ('format-version' = '2');
+
+foreach value 1 2 3
+
+statement ok
+INSERT INTO my_datalake.default.expire_cleanup_appends VALUES ({value});
+
+endloop
+
+statement ok
+SET VARIABLE appends_location = (
+	SELECT json_extract_string(body, '$.metadata.location')
+	FROM iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/expire_cleanup_appends', NULL)
+);
+
+statement ok
+SET VARIABLE appends_data_files = (
+	SELECT list(file ORDER BY file) FROM glob(getvariable('appends_location') || '/**/*.parquet')
+);
+
+query II
+SELECT * FROM iceberg_expire_snapshots('my_datalake.default.expire_cleanup_appends',
+	older_than => TIMESTAMP '2999-01-01', retain_last => 1, clean_expired_files => true);
+----
+2	1
+
+query I
+SELECT list(file ORDER BY file) = getvariable('appends_data_files')
+FROM glob(getvariable('appends_location') || '/**/*.parquet');
+----
+true
+
+# Guard table: unreadable, partial, and outside-table metadata must not delete anything.
+statement ok
+CREATE TABLE my_datalake.default.expire_cleanup_guard (id INTEGER) WITH ('format-version' = '2');
+
+foreach value 1 2
+
+statement ok
+INSERT INTO my_datalake.default.expire_cleanup_guard VALUES ({value});
+
+endloop
+
+statement ok
+SET VARIABLE guard_s1 = (
+	SELECT snapshot_id FROM iceberg_snapshots(my_datalake.default.expire_cleanup_guard)
+	ORDER BY sequence_number LIMIT 1
+);
+
+statement ok
+SET VARIABLE guard_body = (
+	SELECT body FROM iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/expire_cleanup_guard', NULL)
+);
+
+statement ok
+SET VARIABLE guard_location = json_extract_string(getvariable('guard_body'), '$.metadata.location');
+
+statement ok
+SET VARIABLE guard_files = (
+	SELECT list(file ORDER BY file) FROM glob(getvariable('guard_location') || '/**')
+	WHERE file NOT LIKE '%.metadata.json'
+);
+
+# Unreadable: the expired snapshot names a missing manifest list inside the table.
+statement ok
+SET VARIABLE guard_missing = json_merge_patch(getvariable('guard_body'), json_object('metadata',
+	json_merge_patch(json_extract(getvariable('guard_body'), '$.metadata'), json_object('snapshots', (
+		SELECT json_group_array(CASE WHEN (value->>'snapshot-id')::BIGINT = getvariable('guard_s1')
+			THEN json_merge_patch(value, json_object('manifest-list',
+				getvariable('guard_location') || '/metadata/missing.avro'))
+			ELSE value END)
+		FROM json_each(getvariable('guard_body'), '$.metadata.snapshots')
+	)))));
+
+query I
+SELECT status FROM iceberg_test_catalog_request('POST', '/__test/response',
+	json_object('method', 'GET', 'path', '/v1/namespaces/default/tables/expire_cleanup_guard',
+	            'status', 200, 'body', getvariable('guard_missing')));
+----
+204
+
+statement error
+SELECT * FROM iceberg_expire_snapshots('my_datalake.default.expire_cleanup_guard',
+	snapshot_ids => [getvariable('guard_s1')], retain_last => 2, clean_expired_files => true);
+----
+could not read expired snapshot metadata
+
+statement ok
+SELECT status FROM iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+
+query I
+SELECT list(file ORDER BY file) = getvariable('guard_files') FROM glob(getvariable('guard_location') || '/**')
+WHERE file NOT LIKE '%.metadata.json';
+----
+true
+
+# Partial: the expired snapshot omits the live-file metrics cleanup uses to prove its file set.
+statement ok
+SET VARIABLE guard_partial = json_merge_patch(getvariable('guard_body'), json_object('metadata',
+	json_merge_patch(json_extract(getvariable('guard_body'), '$.metadata'), json_object('snapshots', (
+		SELECT json_group_array(CASE WHEN (value->>'snapshot-id')::BIGINT = getvariable('guard_s1')
+			THEN json_merge_patch(value, json_object('summary',
+				json_merge_patch(value->'summary',
+					json_object('total-data-files', 'not-a-number',
+						'total-delete-files', 'not-a-number'))))
+			ELSE value END)
+		FROM json_each(getvariable('guard_body'), '$.metadata.snapshots')
+	)))));
+
+query I
+SELECT status FROM iceberg_test_catalog_request('POST', '/__test/response',
+	json_object('method', 'GET', 'path', '/v1/namespaces/default/tables/expire_cleanup_guard',
+	            'status', 200, 'body', getvariable('guard_partial')));
+----
+204
+
+statement error
+SELECT * FROM iceberg_expire_snapshots('my_datalake.default.expire_cleanup_guard',
+	snapshot_ids => [getvariable('guard_s1')], retain_last => 2, clean_expired_files => true);
+----
+omits its total data/delete file counts
+
+statement ok
+SELECT status FROM iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+
+query I
+SELECT list(file ORDER BY file) = getvariable('guard_files') FROM glob(getvariable('guard_location') || '/**')
+WHERE file NOT LIKE '%.metadata.json';
+----
+true
+
+# Outside: an expired manifest list outside the table location is refused before any read or delete.
+statement ok
+SET VARIABLE guard_outside = json_merge_patch(getvariable('guard_body'), json_object('metadata',
+	json_merge_patch(json_extract(getvariable('guard_body'), '$.metadata'), json_object('snapshots', (
+		SELECT json_group_array(CASE WHEN (value->>'snapshot-id')::BIGINT = getvariable('guard_s1')
+			THEN json_merge_patch(value, json_object('manifest-list',
+				getvariable('guard_location') || '-outside/list.avro'))
+			ELSE value END)
+		FROM json_each(getvariable('guard_body'), '$.metadata.snapshots')
+	)))));
+
+query I
+SELECT status FROM iceberg_test_catalog_request('POST', '/__test/response',
+	json_object('method', 'GET', 'path', '/v1/namespaces/default/tables/expire_cleanup_guard',
+	            'status', 200, 'body', getvariable('guard_outside')));
+----
+204
+
+statement error
+SELECT * FROM iceberg_expire_snapshots('my_datalake.default.expire_cleanup_guard',
+	snapshot_ids => [getvariable('guard_s1')], retain_last => 2, clean_expired_files => true);
+----
+outside the table location
+
+statement ok
+SELECT status FROM iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+
+query I
+SELECT count(*) FROM iceberg_snapshots(my_datalake.default.expire_cleanup_guard);
+----
+2
+
+query I
+SELECT list(file ORDER BY file) = getvariable('guard_files') FROM glob(getvariable('guard_location') || '/**')
+WHERE file NOT LIKE '%.metadata.json';
+----
+true
+
+# A commit that fails with 408 deletes nothing.
+statement ok
+CREATE TABLE my_datalake.default.expire_cleanup_408 (id INTEGER) WITH ('format-version' = '2');
+
+foreach value 1 2
+
+statement ok
+INSERT INTO my_datalake.default.expire_cleanup_408 VALUES ({value});
+
+endloop
+
+statement ok
+SET VARIABLE timeout_s1 = (
+	SELECT snapshot_id FROM iceberg_snapshots(my_datalake.default.expire_cleanup_408)
+	ORDER BY sequence_number LIMIT 1
+);
+
+statement ok
+SET VARIABLE timeout_location = (
+	SELECT json_extract_string(body, '$.metadata.location')
+	FROM iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/expire_cleanup_408', NULL)
+);
+
+statement ok
+SET VARIABLE timeout_files = (
+	SELECT list(file ORDER BY file) FROM glob(getvariable('timeout_location') || '/**')
+	WHERE file NOT LIKE '%.metadata.json'
+);
+
+query I
+SELECT status FROM iceberg_test_catalog_request('POST', '/__test/response',
+	json_object('method', 'POST', 'path', '/v1/transactions/commit',
+	            'status', 408, 'body', '{}'));
+----
+204
+
+statement ok
+BEGIN;
+
+query II
+SELECT * FROM iceberg_expire_snapshots('my_datalake.default.expire_cleanup_408',
+	snapshot_ids => [getvariable('timeout_s1')], retain_last => 2, clean_expired_files => true);
+----
+1	1
+
+statement error
+COMMIT;
+----
+408
+
+statement ok
+SELECT status FROM iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+
+query I
+SELECT count(*) FROM iceberg_snapshots(my_datalake.default.expire_cleanup_408);
+----
+2
+
+query I
+SELECT list(file ORDER BY file) = getvariable('timeout_files') FROM glob(getvariable('timeout_location') || '/**')
+WHERE file NOT LIKE '%.metadata.json';
+----
+true
+
+foreach suffix default rewrite appends guard 408
+
+statement ok
+DROP TABLE my_datalake.default.expire_cleanup_{suffix};
+
+endloop
