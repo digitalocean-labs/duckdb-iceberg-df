@@ -43,6 +43,7 @@ static const IcebergOption OPTIONS[] = {
     {"purge_requested", "purge_requested"},
     {"default_table_location_from_namespace", "default_table_location_from_namespace"},
     {"use_metadata_location", "use_metadata_location"},
+    {"allow_local_file_orphan_deletion", "allow_local_file_orphan_deletion", false, false},
     {"table_resolution", "table_resolution"},
     {"default_schema", "default_schema"},
     {"default_schema_policy", "default_schema_policy", false, false},

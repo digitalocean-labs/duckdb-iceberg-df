@@ -57,6 +57,8 @@ struct IcebergAttachOptions {
 	// load the authoritative table metadata from the LoadTableResult's 'metadata-location' instead of
 	// the embedded response metadata, see duckdb-iceberg#1403
 	bool use_metadata_location = false;
+	// allow iceberg_remove_orphan_files to delete files on a local filesystem; client-only and default off
+	bool allow_local_file_orphan_deletion = false;
 	IcebergTableResolution table_resolution = IcebergTableResolution::LAZY;
 	IcebergDefaultSchemaPolicy default_schema_policy = IcebergDefaultSchemaPolicy::THROW;
 	IcebergIdentifierCase identifier_case = IcebergIdentifierCase::PRESERVE_CASE;

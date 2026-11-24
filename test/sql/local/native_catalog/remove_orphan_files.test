@@ -1,0 +1,343 @@
+# name: test/sql/local/native_catalog/remove_orphan_files.test
+# description: Orphan removal previews by default, floors destructive age, and fails closed on unsafe listings and references
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+include test/sql/init_requires
+
+require json
+
+statement error
+select * from iceberg_remove_orphan_files(NULL);
+----
+table_name cannot be NULL
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.anything', dry_run := NULL);
+----
+'dry_run' cannot be NULL
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.anything', older_than := interval (-1) hour);
+----
+'older_than' must not be negative
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.anything', older_than := interval 2000000 day);
+----
+'older_than' is too large
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.anything', older_than := interval 59 minute, dry_run := false);
+----
+'older_than' must be at least 259200 seconds
+
+statement ok
+begin;
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.anything');
+----
+cannot run inside an explicit transaction
+
+statement ok
+rollback;
+
+statement ok
+create table my_datalake.default.orphan_main (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_main values (1);
+
+statement ok
+insert into my_datalake.default.orphan_main values (2);
+
+statement ok
+set variable main_loc = (select regexp_replace(file_path, '/data/[^/]*$', '') from iceberg_metadata('my_datalake.default.orphan_main') where content = 'DATA' and status <> 'DELETED' limit 1);
+
+statement ok
+set variable main_candidate = (getvariable('main_loc') || '/data/orphan-young.parquet');
+
+statement ok
+copy (select 7 as x) to (getvariable('main_candidate')) (format parquet);
+
+query I
+select deleted_files from iceberg_remove_orphan_files('my_datalake.default.orphan_main', older_than := interval 59 minute);
+----
+0
+
+query IIII
+select orphan_files = 0, young_unreferenced >= 1, referenced_present > 0,
+       listed_files = referenced_present + young_unreferenced + orphan_files
+from iceberg_remove_orphan_files('my_datalake.default.orphan_main', older_than := interval 1 hour);
+----
+true	true	true	true
+
+query I
+select count(*) from glob(getvariable('main_candidate'));
+----
+1
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_main', older_than := interval 3 day, dry_run := false);
+----
+ALLOW_LOCAL_FILE_ORPHAN_DELETION
+
+statement ok
+attach '' as orphan_local (type iceberg, uri 'http://iceberg-mock.invalid', authorization_type 'none', access_delegation_mode 'none', stage_create_tables true, default_schema 'default', allow_local_file_orphan_deletion true);
+
+query III
+select deleted_files, delete_errors, (select count(*) from glob(getvariable('main_candidate')))
+from iceberg_remove_orphan_files('orphan_local.default.orphan_main', older_than := interval 3 day, dry_run := false);
+----
+0	0	1
+
+statement ok
+detach orphan_local;
+
+statement ok
+create table my_datalake.default.orphan_nested (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_nested values (1);
+
+statement ok
+set variable nested_loc = (select regexp_replace(file_path, '/data/[^/]*$', '') from iceberg_metadata('my_datalake.default.orphan_nested') where content = 'DATA' and status <> 'DELETED' limit 1);
+
+statement ok
+copy (select '{}') to (getvariable('nested_loc') || '/data/foreign.metadata.json') (format csv, header false, quote '', delimiter '');
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_nested', older_than := interval 1 hour);
+----
+nested metadata marker
+
+statement ok
+create table my_datalake.default.orphan_paths (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_paths values (1);
+
+statement ok
+set variable paths_body = (select body from iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/orphan_paths', NULL));
+
+statement ok
+set variable relative_body = (select json_merge_patch(getvariable('paths_body')::json, json_object('metadata', json_object('location', 'relative/table'))));
+
+query I
+select status from iceberg_test_catalog_request('POST', '/__test/response', json_object('method', 'GET', 'path', '/v1/namespaces/default/tables/orphan_paths', 'status', 200, 'body', getvariable('relative_body')));
+----
+204
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_paths', older_than := interval 1 hour);
+----
+not an absolute location
+
+query I
+select status from iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+----
+204
+
+statement ok
+set variable paths_loc = (select regexp_replace(file_path, '/data/[^/]*$', '') from iceberg_metadata('my_datalake.default.orphan_paths') where content = 'DATA' and status <> 'DELETED' limit 1);
+
+statement ok
+set variable glob_body = (select json_merge_patch(getvariable('paths_body')::json, json_object('metadata', json_object('location', getvariable('paths_loc') || '/*'))));
+
+query I
+select status from iceberg_test_catalog_request('POST', '/__test/response', json_object('method', 'GET', 'path', '/v1/namespaces/default/tables/orphan_paths', 'status', 200, 'body', getvariable('glob_body')));
+----
+204
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_paths', older_than := interval 1 hour);
+----
+contains glob characters
+
+query I
+select status from iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+----
+204
+
+statement ok
+create table my_datalake.default.orphan_partial (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_partial values (1);
+
+statement ok
+set variable partial_list = (select manifest_list from iceberg_snapshots('my_datalake.default.orphan_partial') order by sequence_number desc limit 1);
+
+statement ok
+copy (select 'truncated') to (getvariable('partial_list')) (format csv, header false, quote '', delimiter '');
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_partial', older_than := interval 1 hour);
+----
+retained file set
+
+statement ok
+create table my_datalake.default.orphan_refs (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_refs values (1);
+
+statement ok
+insert into my_datalake.default.orphan_refs values (2);
+
+statement ok
+set variable refs_first = (select snapshot_id from iceberg_snapshots('my_datalake.default.orphan_refs') order by sequence_number limit 1);
+
+statement ok
+set variable refs_second = (select snapshot_id from iceberg_snapshots('my_datalake.default.orphan_refs') order by sequence_number desc limit 1);
+
+statement ok
+set variable refs_body = (select body from iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/orphan_refs', NULL));
+
+statement ok
+set variable tagged_body = (select json_merge_patch(getvariable('refs_body')::json, json_object('metadata', json_object('current-snapshot-id', getvariable('refs_first'), 'refs', json_object('main', json_object('snapshot-id', getvariable('refs_first'), 'type', 'branch'), 'kept', json_object('snapshot-id', getvariable('refs_second'), 'type', 'tag'))))));
+
+query I
+select status from iceberg_test_catalog_request('POST', '/__test/response', json_object('method', 'GET', 'path', '/v1/namespaces/default/tables/orphan_refs', 'status', 200, 'body', getvariable('tagged_body')));
+----
+204
+
+query III
+select orphan_files, young_unreferenced, referenced_present > 0
+from iceberg_remove_orphan_files('my_datalake.default.orphan_refs', older_than := interval 1 hour);
+----
+0	0	true
+
+query I
+select status from iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+----
+204
+
+# The destructive floor is a setting. Negative values are rejected by normal setting validation.
+statement error
+set iceberg_remove_orphan_files_min_age = interval '-1 second';
+----
+must be a non-negative interval
+
+# A low floor, a real wait and dry_run=false exercise the actual file removal path.
+statement ok
+set iceberg_remove_orphan_files_min_age = interval 1 second;
+
+statement ok
+create table my_datalake.default.orphan_delete (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_delete select i from range(5) t(i);
+
+statement ok
+attach '' as orphan_delete_local (type iceberg, uri 'http://iceberg-mock.invalid', authorization_type 'none', access_delegation_mode 'none', stage_create_tables true, default_schema 'default', allow_local_file_orphan_deletion true);
+
+statement ok
+set variable delete_loc = (select regexp_replace(file_path, '/data/[^/]*$', '') from iceberg_metadata('my_datalake.default.orphan_delete') where content = 'DATA' and status <> 'DELETED' limit 1);
+
+statement ok
+set variable delete_orphan = (getvariable('delete_loc') || '/data/orphan-delete.parquet');
+
+statement ok
+copy (select 99 as x) to (getvariable('delete_orphan')) (format parquet);
+
+statement ok
+set variable delete_entries_before = (select count(*) from iceberg_metadata('my_datalake.default.orphan_delete'));
+
+statement ok
+set variable delete_metadata_before = (select count(*) from glob(getvariable('delete_loc') || '/metadata/*'));
+
+statement ok
+select sleep_ms(2000);
+
+query III
+select orphan_files, deleted_files, delete_errors
+from iceberg_remove_orphan_files('orphan_delete_local.default.orphan_delete', older_than := interval 1 second, dry_run := false);
+----
+1	1	0
+
+query I
+select count(*) from glob(getvariable('delete_orphan'));
+----
+0
+
+query II
+select (select count(*) from iceberg_metadata('my_datalake.default.orphan_delete')) = getvariable('delete_entries_before')::BIGINT,
+       (select count(*) from glob(getvariable('delete_loc') || '/metadata/*')) = getvariable('delete_metadata_before')::BIGINT;
+----
+true	true
+
+query II
+select count(*), sum(id) from my_datalake.default.orphan_delete;
+----
+5	10
+
+query III
+select orphan_files, deleted_files, delete_errors
+from iceberg_remove_orphan_files('orphan_delete_local.default.orphan_delete', older_than := interval 1 second, dry_run := false);
+----
+0	0	0
+
+statement ok
+reset iceberg_remove_orphan_files_min_age;
+
+statement ok
+create table my_datalake.default.orphan_gc (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_gc values (1);
+
+statement ok
+set variable gc_loc = (select regexp_replace(file_path, '/data/[^/]*$', '') from iceberg_metadata('my_datalake.default.orphan_gc') where content = 'DATA' and status <> 'DELETED' limit 1);
+
+statement ok
+set variable gc_candidate = (getvariable('gc_loc') || '/data/gc-candidate.parquet');
+
+statement ok
+copy (select 1 as x) to (getvariable('gc_candidate')) (format parquet);
+
+statement ok
+alter table my_datalake.default.orphan_gc set ('gc.enabled' = 'false');
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_gc');
+----
+cannot run when table property 'gc.enabled' is false
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_gc', older_than := interval 3 day, dry_run := false);
+----
+cannot run when table property 'gc.enabled' is false
+
+query I
+select count(*) from glob(getvariable('gc_candidate'));
+----
+1
+
+statement ok
+alter table my_datalake.default.orphan_gc set ('gc.enabled' = 'not-a-boolean');
+
+statement error
+select * from iceberg_remove_orphan_files('my_datalake.default.orphan_gc');
+----
+invalid value 'not-a-boolean' for table property 'gc.enabled'
+
+statement ok
+create table my_datalake.default.orphan_meta (id integer) with ('format-version' = '2');
+
+statement ok
+insert into my_datalake.default.orphan_meta values (1);
+
+statement ok
+set variable meta_loc = (select regexp_replace(file_path, '/data/[^/]*$', '') from iceberg_metadata('my_datalake.default.orphan_meta') where content = 'DATA' and status <> 'DELETED' limit 1);
+
+statement ok
+copy (select 'stats') to (getvariable('meta_loc') || '/metadata/partition.stats') (format csv, header false, quote '', delimiter '');
+
+query IIII
+select orphan_files, young_unreferenced, listed_files = referenced_present + 1, referenced_present > 0
+from iceberg_remove_orphan_files('my_datalake.default.orphan_meta', older_than := interval 0 second);
+----
+0	0	true	true

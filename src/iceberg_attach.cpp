@@ -248,6 +248,9 @@ static void ParseAttachOptions(IcebergAttachOptions &attach_options, optional<Id
 			    argument.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "use_metadata_location") {
 			attach_options.use_metadata_location = entry.second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		} else if (lower_name == "allow_local_file_orphan_deletion") {
+			attach_options.allow_local_file_orphan_deletion =
+			    entry.second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "table_resolution") {
 			auto value = StringUtil::Lower(argument.ToString());
 			if (value == "lazy") {

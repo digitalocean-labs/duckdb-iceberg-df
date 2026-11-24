@@ -32,8 +32,16 @@
 #include "function/copy/iceberg_copy_function.hpp"
 #include "duckdb/planner/planner_extension.hpp"
 #include "planning/iceberg_planner.hpp"
+#include "maintenance/orphan_files.hpp"
 
 namespace duckdb {
+
+static void SetOrphanFilesMinAge(ClientContext &context, SetScope scope, Value &parameter) {
+	int64_t micros;
+	if (parameter.IsNull() || !Interval::TryGetMicro(IntervalValue::Get(parameter), micros) || micros < 0) {
+		throw InvalidConfigurationException("'%s' must be a non-negative interval", ORPHAN_FILES_MIN_AGE_SETTING);
+	}
+}
 
 static void SetDefaultFormatVersion(ClientContext &context, SetScope scope, Value &parameter) {
 	auto version = parameter.GetValue<uint64_t>();
@@ -129,6 +137,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "The Iceberg format version used when creating a new table without an explicit 'format-version' property. "
 	    "Valid values are 2 and 3.",
 	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_ICEBERG_FORMAT_VERSION), SetDefaultFormatVersion);
+	config.AddExtensionOption(ORPHAN_FILES_MIN_AGE_SETTING, "Minimum destructive iceberg_remove_orphan_files age",
+	                          LogicalType::INTERVAL, Value::INTERVAL(0, 3, 0), SetOrphanFilesMinAge);
 	config.AddExtensionOption(
 	    "iceberg_use_metadata_log",
 	    "Use metadata-log to select table metadata as of the transaction start for snapshot isolation. "
