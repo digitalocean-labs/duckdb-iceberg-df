@@ -301,9 +301,62 @@ static void VerifyDeleteRetryability(const IcebergTable &table_info,
 	    table_info.name, std::to_string(scan_snapshot_id), std::to_string(tip_snapshot_id));
 }
 
+//! Replay local upgrades to get the version this rewrite will commit
+static int32_t ExpectedCommitFormatVersion(const IcebergTransactionData &transaction_data) {
+	int32_t expected = transaction_data.initial_format_version;
+	for (auto &update : transaction_data.updates) {
+		if (update->type == IcebergTableUpdateType::UPGRADE_FORMAT_VERSION) {
+			auto staged = update->Cast<UpgradeFormatVersion>().format_version;
+			expected = MaxValue(expected, staged);
+		}
+	}
+	return expected;
+}
+
+//! An upgrade after REPLACE would wrap V2 COPY output in V3 metadata
+static bool FormatUpgradeAfterReplace(const IcebergTransactionData &transaction_data) {
+	bool saw_replace = false;
+	for (auto &update : transaction_data.updates) {
+		if (update->type == IcebergTableUpdateType::ADD_SNAPSHOT) {
+			saw_replace |= update->Cast<IcebergAddSnapshot>().GetOperation() == IcebergSnapshotOperationType::REPLACE;
+		} else if (update->type == IcebergTableUpdateType::UPGRADE_FORMAT_VERSION && saw_replace) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! A remote format upgrade can leave the snapshot unchanged, so check it before serialization
+static void VerifyRewriteFormatBeforeCommit(IcebergTable &table_info, ClientContext &context) {
+	if (!table_info.transaction_data || !table_info.transaction_data->has_maintenance_rewrite) {
+		return;
+	}
+	auto &transaction_data = *table_info.transaction_data;
+	auto expected = ExpectedCommitFormatVersion(transaction_data);
+	if (FormatUpgradeAfterReplace(transaction_data)) {
+		throw TransactionException(
+		    "iceberg_rewrite_data_files on \"%s\": a format-version upgrade after the rewrite is not supported. "
+		    "Upgrade the table before rewriting.",
+		    table_info.name);
+	}
+	auto probe = table_info.Copy();
+	probe.RefreshFromCatalog(context);
+	if (probe.GetMetadata().iceberg_version > expected) {
+		throw TransactionException(
+		    "iceberg_rewrite_data_files on \"%s\": table format-version advanced to %d after planning. Nothing was "
+		    "committed. Re-run the rewrite.",
+		    table_info.name, probe.GetMetadata().iceberg_version);
+	}
+	//! Remove only the probe's result so committed metadata cannot stay stale
+	if (probe.initialization_source) {
+		table_info.catalog.table_request_cache.EvictIfCurrent(probe);
+	}
+}
+
 static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, IcebergTable &table_info,
                                                       ClientContext &context) {
 	SingleTableStagedCommit info;
+	VerifyRewriteFormatBeforeCommit(table_info, context);
 	IcebergCommitState commit_state(table_info, context);
 	auto &table_change = commit_state.table_change;
 	auto &schema = table_info.schema.Cast<IcebergSchemaEntry>();

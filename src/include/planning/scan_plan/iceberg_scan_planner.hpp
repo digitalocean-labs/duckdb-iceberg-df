@@ -41,6 +41,7 @@ public:
 	void SetScanOrder(unique_ptr<RowGroupOrderOptions> options);
 	void DisableServerSidePlanning();
 	void RequireRowIds();
+	void InheritSequenceNumbers();
 
 	const IcebergTableFilters &Filters() const;
 

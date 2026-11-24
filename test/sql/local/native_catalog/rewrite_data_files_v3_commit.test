@@ -1,0 +1,138 @@
+# name: test/sql/local/native_catalog/rewrite_data_files_v3_commit.test
+# description: V3 compaction format guards preserve data and idempotent settings
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+
+include test/sql/init_requires
+
+statement ok
+ATTACH OR REPLACE '' AS my_datalake (TYPE ICEBERG, URI 'http://iceberg-mock.invalid',
+	AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', STAGE_CREATE_TABLES true,
+	MAX_TABLE_STALENESS '10 minutes');
+
+statement ok
+CALL enable_logging('HTTP', storage='memory');
+
+# ---- 1: remote V2 to V3 upgrade cannot publish the staged V2 rewrite ----
+statement ok
+CREATE TABLE my_datalake.default.rw_v3_guard_remote (id INTEGER) WITH ('format-version' = 2);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_guard_remote VALUES (0), (1), (2);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_guard_remote VALUES (3), (4), (5);
+
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+CALL iceberg_rewrite_data_files('my_datalake.default.rw_v3_guard_remote', min_input_files => 2);
+
+statement ok con2
+ALTER TABLE my_datalake.default.rw_v3_guard_remote SET ('format-version' = 3);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement error con1
+COMMIT;
+----
+<REGEX>:(?i).*table format-version advanced.*
+
+query I
+SELECT count(*)
+FROM duckdb_logs_parsed('HTTP')
+WHERE request.type = 'POST'
+  AND (request.url LIKE '%/transactions/commit' OR request.url LIKE '%/tables/rw_v3_guard_remote');
+----
+0
+
+query I
+SELECT count(*) FROM my_datalake.default.rw_v3_guard_remote;
+----
+6
+
+# ---- 2: real post-REPLACE upgrades fail, but setting the current version succeeds ----
+statement ok
+CREATE TABLE my_datalake.default.rw_v3_after (id INTEGER) WITH ('format-version' = 2);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_after VALUES (0), (1);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_after VALUES (2), (3);
+
+
+statement ok
+BEGIN;
+
+statement ok
+CALL iceberg_rewrite_data_files('my_datalake.default.rw_v3_after', min_input_files => 2);
+
+statement ok
+ALTER TABLE my_datalake.default.rw_v3_after SET ('format-version' = 3);
+
+statement error
+COMMIT;
+----
+<REGEX>:(?i).*format-version upgrade after the rewrite.*
+
+# ---- 3: a staged upgrade before rewrite and a no-op after it both commit ----
+statement ok
+CREATE TABLE my_datalake.default.rw_v3_staged (id INTEGER) WITH ('format-version' = 2);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_staged VALUES (0), (1);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_staged VALUES (2), (3);
+
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE my_datalake.default.rw_v3_staged SET ('format-version' = 3);
+
+statement ok
+CALL iceberg_rewrite_data_files('my_datalake.default.rw_v3_staged', min_input_files => 2);
+
+statement ok
+ALTER TABLE my_datalake.default.rw_v3_staged SET ('format-version' = 3);
+
+statement ok
+COMMIT;
+
+query III
+SELECT count(*), count(distinct _row_id),
+       count(*) filter (where _row_id is null or _last_updated_sequence_number is null)
+FROM my_datalake.default.rw_v3_staged;
+----
+4	4	0
+
+# ---- 4: the copied probe does not hide the committed REPLACE in the staleness cache ----
+statement ok
+CREATE TABLE my_datalake.default.rw_v3_cache (id INTEGER) WITH ('format-version' = 2);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_cache VALUES (0), (1), (2);
+
+statement ok
+INSERT INTO my_datalake.default.rw_v3_cache VALUES (3), (4), (5);
+
+
+statement ok
+CALL iceberg_rewrite_data_files('my_datalake.default.rw_v3_cache', min_input_files => 2);
+
+query II
+SELECT (SELECT count(*) FROM iceberg_snapshots('my_datalake.default.rw_v3_cache')),
+       (SELECT count(*) FROM iceberg_snapshots('my_datalake.default.rw_v3_cache') WHERE operation = 'replace');
+----
+3	1
+
+statement ok
+DROP TABLE my_datalake.default.rw_v3_cache;

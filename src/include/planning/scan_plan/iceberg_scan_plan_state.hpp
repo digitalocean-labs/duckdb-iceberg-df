@@ -23,6 +23,7 @@ struct IcebergScanConfiguration {
 	IcebergOptions options;
 	bool server_side_planning_enabled = true;
 	bool row_ids_required = false;
+	bool inherit_sequence_numbers = false;
 };
 
 //! Metadata-planning state shared by filtered views of one Iceberg scan.
@@ -47,6 +48,7 @@ public:
 	void SetTable(IcebergTableSchemaVersion &table) DUCKDB_REQUIRES(lock);
 	void DisableServerSidePlanning() DUCKDB_REQUIRES(lock);
 	void RequireRowIds() DUCKDB_REQUIRES(lock);
+	void InheritSequenceNumbers() DUCKDB_REQUIRES(lock);
 	void FreezeConfiguration() DUCKDB_REQUIRES(lock);
 	//! The first planning request selects the provider; subsequent filtered views reuse it.
 	IcebergScanPlanProvider &GetScanPlanProvider(const IcebergTableFilters &filters, const IcebergScanOrder &scan_order)

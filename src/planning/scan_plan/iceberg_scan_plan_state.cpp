@@ -56,6 +56,14 @@ void IcebergScanPlanState::RequireRowIds() {
 	configuration.row_ids_required = true;
 }
 
+void IcebergScanPlanState::InheritSequenceNumbers() {
+	if (configuration.inherit_sequence_numbers) {
+		return;
+	}
+	RequireConfigurable();
+	configuration.inherit_sequence_numbers = true;
+}
+
 void IcebergScanPlanState::FreezeConfiguration() {
 	if (!configuration.scan_info) {
 		throw InternalException("Cannot start Iceberg scan planning without scan metadata");

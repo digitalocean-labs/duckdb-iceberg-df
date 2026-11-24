@@ -22,6 +22,7 @@
 #include "function/iceberg_functions.hpp"
 #include "maintenance/rewrite_data_files_operator.hpp"
 #include "maintenance/rewrite_data_files_planner.hpp"
+#include "planning/iceberg_multi_file_list.hpp"
 
 namespace duckdb {
 
@@ -138,9 +139,13 @@ static RewriteDataFilesPlanInput ParseRewritePlanInput(ClientContext &context, T
 }
 
 //! Read through the attached Iceberg table so the scan layer applies MoR position/equality deletes.
-static unique_ptr<QueryNode> BuildCandidateSelect(const QualifiedName &table_name) {
+static unique_ptr<QueryNode> BuildCandidateSelect(const QualifiedName &table_name, bool row_lineage) {
 	auto select = make_uniq<SelectNode>();
 	select->select_list.push_back(make_uniq<StarExpression>());
+	if (row_lineage) {
+		select->select_list.push_back(make_uniq<ColumnRefExpression>("_row_id"));
+		select->select_list.push_back(make_uniq<ColumnRefExpression>("_last_updated_sequence_number"));
+	}
 
 	auto table = make_uniq<BaseTableRef>();
 	table->SetQualifiedName(table_name);
@@ -151,7 +156,7 @@ static unique_ptr<QueryNode> BuildCandidateSelect(const QualifiedName &table_nam
 
 //! Scope the scan under the bound COPY to the selected files with a filter on the `filename` virtual column. The
 //! column is added by its id, not its name, so a table column that is also called `filename` can't hide it.
-static void FilterCandidateFiles(LogicalOperator &copy, const vector<RewriteCandidate> &candidates) {
+static void FilterCandidateFiles(LogicalOperator &copy, const vector<RewriteCandidate> &candidates, bool row_lineage) {
 	reference<LogicalOperator> parent = copy;
 	while (parent.get().children.size() == 1 && parent.get().children[0]->type != LogicalOperatorType::LOGICAL_GET) {
 		parent = *parent.get().children[0];
@@ -160,6 +165,10 @@ static void FilterCandidateFiles(LogicalOperator &copy, const vector<RewriteCand
 		throw InternalException("iceberg_rewrite_data_files: expected the COPY to read a single table scan");
 	}
 	auto &get = parent.get().children[0]->Cast<LogicalGet>();
+	if (row_lineage) {
+		auto &file_list = get.bind_data->Cast<MultiFileBindData>().file_list->Cast<IcebergMultiFileList>();
+		file_list.GetScanPlanner().InheritSequenceNumbers();
+	}
 	auto entry = get.virtual_columns.find(MultiFileReader::COLUMN_IDENTIFIER_FILENAME);
 	if (entry == get.virtual_columns.end()) {
 		throw InternalException("iceberg_rewrite_data_files: the table scan has no filename column");
@@ -191,7 +200,7 @@ static unique_ptr<LogicalOperator> BindCandidateCopy(Binder &binder, const Rewri
 
 	auto &fs = FileSystem::GetFileSystem(binder.context);
 	CopyStatement copy_statement;
-	copy_statement.info->select_statement = BuildCandidateSelect(plan.table_name);
+	copy_statement.info->select_statement = BuildCandidateSelect(plan.table_name, plan.write_row_lineage);
 	copy_statement.info->file_path = metadata.GetDataPath(fs);
 	copy_statement.info->format = "parquet";
 	copy_statement.info->is_from = false;
@@ -206,7 +215,7 @@ static unique_ptr<LogicalOperator> BindCandidateCopy(Binder &binder, const Rewri
 
 	auto copy_binder = Binder::CreateBinder(binder.context, &binder);
 	auto bound_copy = copy_binder->Bind(copy_statement);
-	FilterCandidateFiles(*bound_copy.plan, plan.selected_candidates);
+	FilterCandidateFiles(*bound_copy.plan, plan.selected_candidates, plan.write_row_lineage);
 	return std::move(bound_copy.plan);
 }
 

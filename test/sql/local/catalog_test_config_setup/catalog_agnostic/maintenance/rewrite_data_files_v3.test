@@ -1,0 +1,280 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/rewrite_data_files_v3.test
+# description: V3 compaction preserves lineage and removes only replaced files and their deletion vectors
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env FORMAT_V3_SUPPORT
+
+require-env METADATA_FILE_READ_SUPPORT
+
+include test/sql/init_requires
+
+# ---- 1: lineage, sequence pin and manifest range ----
+statement ok
+create table my_datalake.default.rw_v3_lineage (id INTEGER) WITH ('format-version' = 3);
+
+statement ok
+insert into my_datalake.default.rw_v3_lineage select * from range(3);
+
+statement ok
+insert into my_datalake.default.rw_v3_lineage select 3 + range from range(3);
+
+statement ok
+insert into my_datalake.default.rw_v3_lineage select 6 + range from range(3);
+
+
+statement ok
+set variable starting_seq = ( select max(data_sequence_number) from iceberg_metadata('my_datalake.default.rw_v3_lineage') where content = 'DATA' and status <> 'DELETED' );
+
+statement ok
+set variable nrid_before = ( select metadata."next-row-id"::BIGINT from iceberg_load_table_response('my_datalake.default.rw_v3_lineage') );
+
+query IIIII
+call iceberg_rewrite_data_files('my_datalake.default.rw_v3_lineage', min_input_files => 2);
+----
+3	1	<REGEX>:[1-9][0-9]*	0	0
+
+query I
+select string_agg(_row_id, ',' order by id) from my_datalake.default.rw_v3_lineage;
+----
+0,1,2,3,4,5,6,7,8
+
+query I
+select metadata."next-row-id"::BIGINT - getvariable('nrid_before')
+from iceberg_load_table_response('my_datalake.default.rw_v3_lineage');
+----
+9
+
+query I
+select count(*) from iceberg_metadata('my_datalake.default.rw_v3_lineage')
+where content = 'DATA' and data_sequence_number = getvariable('starting_seq') and status <> 'DELETED';
+----
+1
+
+statement ok
+begin;
+
+statement ok
+set variable p = ( select file_path from iceberg_metadata('my_datalake.default.rw_v3_lineage') where content = 'DATA' and status <> 'DELETED' );
+
+statement ok
+set variable m = ( select manifest_path from iceberg_metadata('my_datalake.default.rw_v3_lineage') where content = 'DATA' and status <> 'DELETED' );
+
+query II
+select count(distinct s.file_name || s.field_id), count(*) filter (where m.stats_null_count is distinct from 0)
+from parquet_schema(getvariable('p')) s
+join parquet_metadata(getvariable('p')) m on s.file_name = m.file_name and s.name = m.path_in_schema
+where s.field_id in (2147483540, 2147483539);
+----
+2	0
+
+query I
+select count(*) filter (where first_row_id is null)
+from (select unnest(data_file) from read_avro(getvariable('m'))) where file_path = getvariable('p');
+----
+1
+
+statement ok
+commit;
+
+# ---- 2: partial rewrite removes selected DVs only, preserving survivor lineage ----
+statement ok
+create table my_datalake.default.rw_v3_partial (id INTEGER, cat VARCHAR)
+partitioned by (cat) WITH ('format-version' = 3);
+
+loop i 0 3
+
+statement ok
+insert into my_datalake.default.rw_v3_partial values ({i} * 3, chr(97 + {i})), ({i} * 3 + 1, chr(97 + {i})), ({i} * 3 + 2, chr(97 + {i}));
+
+endloop
+
+
+statement ok
+delete from my_datalake.default.rw_v3_partial where id in (1, 4, 7);
+
+query I
+select count(*) from iceberg_metadata('my_datalake.default.rw_v3_partial') where content = 'POSITION_DELETES' and status <> 'DELETED';
+----
+3
+
+query IIIII
+call iceberg_rewrite_data_files('my_datalake.default.rw_v3_partial',
+	min_input_files => 2, max_files_to_rewrite => 2, rewrite_all => true);
+----
+2	<REGEX>:[1-9][0-9]*	<REGEX>:[1-9][0-9]*	0	2
+
+query III
+select count(*), count(*) filter (where id in (1, 4, 7)), count(distinct filename) from my_datalake.default.rw_v3_partial;
+----
+6	0	3
+
+query I
+select count(*) from iceberg_metadata('my_datalake.default.rw_v3_partial') where content = 'POSITION_DELETES' and status <> 'DELETED';
+----
+1
+
+query I
+select string_agg(_row_id, ',' order by id) from my_datalake.default.rw_v3_partial;
+----
+0,2,3,5,6,8
+
+# ---- 3: zero surviving rows still commit a removals-only REPLACE ----
+statement ok
+create table my_datalake.default.rw_v3_empty_all (id INTEGER) WITH ('format-version' = 3);
+
+statement ok
+insert into my_datalake.default.rw_v3_empty_all values (0), (1);
+
+statement ok
+insert into my_datalake.default.rw_v3_empty_all values (2), (3);
+
+statement ok
+delete from my_datalake.default.rw_v3_empty_all;
+
+query IIIII
+call iceberg_rewrite_data_files('my_datalake.default.rw_v3_empty_all', min_input_files => 2);
+----
+2	0	<REGEX>:[1-9][0-9]*	0	2
+
+query II
+select count(*) filter (where content = 'DATA'), count(*) filter (where content = 'POSITION_DELETES')
+from iceberg_metadata('my_datalake.default.rw_v3_empty_all') where status <> 'DELETED';
+----
+0	0
+
+query I
+select count(*) from iceberg_snapshots('my_datalake.default.rw_v3_empty_all') where operation = 'replace';
+----
+1
+
+# ---- 4: committed V2 to V3 upgrade keeps each file's source sequence number ----
+statement ok
+create table my_datalake.default.rw_v3_upgraded (id INTEGER) WITH ('format-version' = 2);
+
+statement ok
+insert into my_datalake.default.rw_v3_upgraded values (0), (1);
+
+statement ok
+insert into my_datalake.default.rw_v3_upgraded values (2), (3);
+
+statement ok
+insert into my_datalake.default.rw_v3_upgraded values (4), (5);
+
+
+statement ok
+create or replace temp table seq_before as select id, data_sequence_number as seq from my_datalake.default.rw_v3_upgraded t join (select file_path, data_sequence_number from iceberg_metadata('my_datalake.default.rw_v3_upgraded') where content = 'DATA') m on t.filename = m.file_path;
+
+statement ok
+alter table my_datalake.default.rw_v3_upgraded set ('format-version' = 3);
+
+query IIIII
+call iceberg_rewrite_data_files('my_datalake.default.rw_v3_upgraded', min_input_files => 2);
+----
+3	1	<REGEX>:[1-9][0-9]*	0	0
+
+query III
+select count(*), count(distinct _row_id), count(*) filter (where _row_id is null or _last_updated_sequence_number is null)
+from my_datalake.default.rw_v3_upgraded;
+----
+6	6	0
+
+query I
+select count(*) from (
+	(select id, _last_updated_sequence_number from my_datalake.default.rw_v3_upgraded) except (select id, seq from seq_before)
+);
+----
+0
+
+# ---- 5: reserved names are refused and real user columns keep manifest bounds ----
+statement ok
+create table my_datalake.default.rw_v3_reserved (id INTEGER, _row_id BIGINT) WITH ('format-version' = 3);
+
+statement ok
+insert into my_datalake.default.rw_v3_reserved values (1, 99), (2, 100);
+
+statement ok
+insert into my_datalake.default.rw_v3_reserved values (3, 101), (4, 102);
+
+statement ok
+begin;
+
+statement ok
+set variable m = ( select list(manifest_path) from iceberg_metadata('my_datalake.default.rw_v3_reserved') where content = 'DATA' and status <> 'DELETED' );
+
+query I
+select count(*) from (
+	select unnest(map_keys(lower_bounds)) k from (select unnest(data_file) from read_avro(getvariable('m')))
+) where k = 2;
+----
+2
+
+statement ok
+commit;
+
+statement error
+call iceberg_rewrite_data_files('my_datalake.default.rw_v3_reserved', min_input_files => 2);
+----
+<REGEX>:(?i).*(_row_id|reserved).*
+
+# ---- 6: VARIANT and a deleted row survive logically ----
+require-env VARIANT_SUPPORT
+
+
+statement ok
+create table my_datalake.default.rw_v3_variant (id INTEGER, v VARIANT) WITH ('format-version' = 3);
+
+loop i 0 4
+
+statement ok
+insert into my_datalake.default.rw_v3_variant
+select {i} * 2 + range, {'a': {i} * 2 + range, 'b': 'x' || range}::VARIANT from range(2);
+
+endloop
+
+
+statement ok
+insert into my_datalake.default.rw_v3_variant values (100, [1, 2, 3]::VARIANT), (101, {'z': {'n': 1.5}}::VARIANT);
+
+statement ok
+delete from my_datalake.default.rw_v3_variant where id = 5;
+
+statement ok
+create or replace temp table var_before as select id, CAST(v AS VARCHAR) AS s, _row_id, _last_updated_sequence_number from my_datalake.default.rw_v3_variant;
+
+query IIIII
+call iceberg_rewrite_data_files('my_datalake.default.rw_v3_variant', min_input_files => 2);
+----
+5	1	<REGEX>:[1-9][0-9]*	0	1
+
+query I
+select count(*) from (
+	(select id, CAST(v AS VARCHAR), _row_id, _last_updated_sequence_number from my_datalake.default.rw_v3_variant) except select * from var_before
+	union all
+	(select * from var_before) except (select id, CAST(v AS VARCHAR), _row_id, _last_updated_sequence_number from my_datalake.default.rw_v3_variant)
+);
+----
+0
+
+query II
+select count(*), count(*) filter (where id = 5) from my_datalake.default.rw_v3_variant;
+----
+9	0
+
+statement ok
+begin;
+
+statement ok
+set variable p = ( select file_path from iceberg_metadata('my_datalake.default.rw_v3_variant') where content = 'DATA' and status <> 'DELETED' );
+
+query I
+select count(*) > 0 from parquet_schema(getvariable('p')) where name = 'typed_value';
+----
+true
+
+statement ok
+commit;
+
+statement ok
+drop table my_datalake.default.rw_v3_variant;

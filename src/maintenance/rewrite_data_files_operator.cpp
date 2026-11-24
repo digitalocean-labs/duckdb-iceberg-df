@@ -81,7 +81,9 @@ PhysicalOperator &LogicalRewriteDataFiles::CreatePlan(ClientContext &context, Ph
 	auto &scan = planner.CreatePlan(*logical_child.children[0]);
 	//! Vended credentials are already installed: PlanRewrite loads them for the manifests,
 	//! and BindCandidateCopy's table scan bind calls PrepareIcebergScanFromEntry.
-	rewrite.PlanCopy(context, planner, metadata, scan, NumericCast<idx_t>(rewrite.plan.target_file_size_bytes));
+	rewrite.PlanCopy(context, planner, metadata, scan, NumericCast<idx_t>(rewrite.plan.target_file_size_bytes),
+	                 rewrite.plan.write_row_lineage ? IcebergInsertVirtualColumns::WRITE_ROW_ID_AND_SEQUENCE_NUMBER
+	                                                : IcebergInsertVirtualColumns::NONE);
 	return rewrite;
 }
 
@@ -108,6 +110,9 @@ IcebergFileRewriteInput PhysicalRewriteDataFiles::GetRewriteInput(const IcebergF
 	}
 	for (auto &path : plan.delete_files_to_remove) {
 		result.replaced_files.emplace_back(path);
+	}
+	for (auto &dv : plan.dangling_dvs) {
+		result.replaced_files.emplace_back(dv);
 	}
 	return result;
 }
@@ -161,7 +166,8 @@ SourceResultType PhysicalRewriteDataFiles::GetDataInternal(ExecutionContext &con
 		for (auto &candidate : gstate.plan.selected_candidates) {
 			rewritten_bytes += candidate.file_size_in_bytes;
 		}
-		removed_delete_files = NumericCast<int64_t>(gstate.plan.delete_files_to_remove.size());
+		removed_delete_files =
+		    NumericCast<int64_t>(gstate.plan.delete_files_to_remove.size() + gstate.plan.dangling_dvs.size());
 	}
 	chunk.data[0].Append(Value::BIGINT(rewritten_data_files));
 	chunk.data[1].Append(Value::BIGINT(added_data_files));
